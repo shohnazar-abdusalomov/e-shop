@@ -1,4 +1,4 @@
-import HeroBanner from "./herobanner.png"
+import HeroBanner from "./HeroBanner.png"
 import productbanner from "./productbanner.png"
 import Banner from "./Banner.png"
 import chair from "./chair.png"
