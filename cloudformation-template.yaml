@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'E-SHOP Application - AWS EC2 Auto-Deployment Template'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type (t2.micro is free tier eligible)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+
+  DomainName:
+    Type: String
+    Default: your-domain.com
+    Description: Domain name for the application (optional)
+
+  Email:
+    Type: String
+    Default: admin@example.com
+    Description: Email for SSL certificate notifications
+
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment type
+
+Conditions:
+  CreateProductionResources: !Equals [!Ref EnvironmentName, production]
+
+Resources:
+  # ============================================
+  # Security Group
+  # ============================================
+  EShopSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for E-SHOP application
+      VpcId: !GetAtt DefaultVPC.VpcId
+      SecurityGroupIngress:
+        # SSH
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+        # HTTP
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        # HTTPS
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: eshop-security-group
+
+  # ============================================
+  # IAM Role for EC2
+  # ============================================
+  EShopEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EShopEC2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::eshop-${AWS::AccountId}/*'
+                  - !Sub 'arn:aws:s3:::eshop-${AWS::AccountId}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  EShopInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EShopEC2Role
+
+  # ============================================
+  # Elastic IP
+  # ============================================
+  EShopElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: eshop-elastic-ip
+
+  # ============================================
+  # EC2 Instance
+  # ============================================
+  EShopInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EShopInstanceProfile
+      SecurityGroupIds:
+        - !Ref EShopSecurityGroup
+      EbsOptimized: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Log all output
+          exec > >(tee /var/log/user-data.log)
+          exec 2>&1
+          
+          echo "=================================="
+          echo "E-SHOP Auto-Deployment Started"
+          echo "=================================="
+          
+          # Update system
+          apt-get update
+          apt-get upgrade -y
+          
+          # Install Node.js 18
+          curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+          apt-get install -y nodejs
+          
+          # Install tools
+          apt-get install -y nginx git certbot python3-certbot-nginx curl wget
+          npm install -g pm2
+          
+          # Setup app directory
+          mkdir -p /var/www/eshop
+          chown -R ubuntu:ubuntu /var/www/eshop
+          
+          # Clone repository
+          cd /var/www/eshop
+          sudo -u ubuntu git clone https://github.com/shohnazar-abdusalomov/e-shop.git .
+          
+          # Install and build
+          cd /var/www/eshop/client
+          sudo -u ubuntu npm ci --production
+          sudo -u ubuntu npm install --production
+          sudo -u ubuntu npm run build
+          
+          # Setup Nginx
+          sudo cp /var/www/eshop/nginx.conf /etc/nginx/sites-available/eshop
+          sed -i "s/your-domain.com/${DomainName}/g" /etc/nginx/sites-available/eshop
+          ln -sf /etc/nginx/sites-available/eshop /etc/nginx/sites-enabled/
+          rm -f /etc/nginx/sites-enabled/default
+          nginx -t
+          systemctl restart nginx
+          systemctl enable nginx
+          
+          # Setup PM2
+          cp /var/www/eshop/ecosystem.config.js ./
+          sudo -u ubuntu pm2 start ecosystem.config.js
+          sudo -u ubuntu pm2 save
+          env PATH=$PATH:/usr/bin /usr/local/lib/node_modules/pm2/bin/pm2 startup systemd -u ubuntu --hp /home/ubuntu
+          
+          # Setup firewall
+          ufw allow 22/tcp
+          ufw allow 80/tcp
+          ufw allow 443/tcp
+          ufw --force enable
+          
+          # Setup SSL if domain is not default
+          if [ "${DomainName}" != "your-domain.com" ]; then
+            certbot certonly --nginx \
+              -d ${DomainName} \
+              -d www.${DomainName} \
+              --non-interactive \
+              --agree-tos \
+              -m ${Email} 2>/dev/null || true
+            systemctl reload nginx
+          fi
+          
+          echo "=================================="
+          echo "✅ Auto-Deployment Complete!"
+          echo "=================================="
+          
+      Tags:
+        - Key: Name
+          Value: eshop-application
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================
+  # Associate Elastic IP with Instance
+  # ============================================
+  AssociateElasticIP:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref EShopInstance
+      AllocationId: !GetAtt EShopElasticIP.AllocationId
+
+  # ============================================
+  # CloudWatch Log Group
+  # ============================================
+  EShopLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /eshop/application
+      RetentionInDays: 30
+
+  # ============================================
+  # CloudWatch Alarms
+  # ============================================
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateProductionResources
+    Properties:
+      AlarmName: eshop-instance-status-check
+      AlarmDescription: Alert if EC2 instance status checks fail
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EShopInstance
+
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateProductionResources
+    Properties:
+      AlarmName: eshop-high-cpu
+      AlarmDescription: Alert if CPU usage is high
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EShopInstance
+
+  # ============================================
+  # S3 Bucket for Backups
+  # ============================================
+  EShopBackupBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateProductionResources
+    Properties:
+      BucketName: !Sub 'eshop-backups-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBackups
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: eshop-backup-bucket
+
+  # ============================================
+  # Default VPC
+  # ============================================
+  DefaultVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+Outputs:
+  InstanceId:
+    Description: Instance ID
+    Value: !Ref EShopInstance
+
+  InstancePublicIP:
+    Description: Public IP of the instance
+    Value: !Ref EShopElasticIP
+
+  ElasticIPAllocationId:
+    Description: Elastic IP Allocation ID
+    Value: !GetAtt EShopElasticIP.AllocationId
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref EShopSecurityGroup
+
+  SSHCommand:
+    Description: SSH command to connect to the instance
+    Value: !Sub 'ssh -i /path/to/${KeyName}.pem ubuntu@${EShopElasticIP}'
+
+  ApplicationURL:
+    Description: Application URL
+    Value: !Sub 'http://${EShopElasticIP}'
+
+  SSLApplicationURL:
+    Description: Application URL with SSL (when domain is configured)
+    Value: !Sub 'https://${DomainName}'
+
+  CloudFormationStackId:
+    Description: CloudFormation Stack ID
+    Value: !Ref AWS::StackId
+
+  LogGroup:
+    Description: CloudWatch Log Group
+    Value: !Ref EShopLogGroup

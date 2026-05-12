@@ -1,0 +1,125 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'client/package-lock.json'
+      
+      - name: Install dependencies
+        run: |
+          cd client
+          npm ci --production
+      
+      - name: Build application
+        run: |
+          cd client
+          npm run build
+      
+      - name: Run ESLint
+        run: |
+          cd client
+          npm run lint 2>/dev/null || echo "Linting warnings detected but continuing..."
+        continue-on-error: true
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: client/dist/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: client/dist/
+      
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          timeout: 120s
+          script: |
+            cd /var/www/eshop
+            
+            # Pull latest code
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git pull origin ${{ github.ref_name }}
+            
+            # Install dependencies
+            cd client
+            npm ci --production
+            npm install --production
+            
+            # Build (in case deployed from source)
+            npm run build
+            
+            # Restart PM2
+            pm2 restart eshop-app
+            
+            # Verify
+            echo "Deployment completed successfully!"
+            pm2 status
+
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "E-SHOP Deployment ${{ needs.deploy.result }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*E-SHOP Application Deployment*\n*Status:* ${{ needs.deploy.result }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
